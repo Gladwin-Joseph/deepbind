@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: drug-discovery-api
+    env: python
+    region: oregon
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app.main:app --workers 1 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT --timeout 300
+    envVars:
+      - key: USE_CPU
+        value: "true"
+      - key: LOAD_MODELS_ON_STARTUP
+        value: "false"
+      - key: PYTHON_VERSION
+        value: "3.12.0"
+```
+
+## 📝 Step 5: Create `backend/.slugignore` (Optional)
+```
+*.pyc
+__pycache__/
+.git/
+.pytest_cache/
+tests/
+*.ipynb

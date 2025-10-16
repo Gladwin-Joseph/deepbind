@@ -3,7 +3,6 @@ from fastapi.middleware.cors import CORSMiddleware
 import torch
 import os
 from pathlib import Path
-from .render import router as render_router
 
 from .schemas import (
     DTIPredictionRequest,
@@ -13,78 +12,84 @@ from .schemas import (
     DrugCandidate,
     HealthResponse
 )
-from .models import DTIModel, Generator, Discriminator
-from .utils.dti_predictor import DTIPredictor
-from .utils.drug_generator import DrugGenerator
+from .models import DTIModel, Generator
+from .config import DEVICE, LOAD_MODELS_ON_STARTUP, DTI_MODEL_PATH, GENERATOR_MODEL_PATH
 
 # Initialize FastAPI app
 app = FastAPI(
     title="Drug Discovery API",
-    description="AI-powered drug discovery platform with DTI prediction and drug generation",
+    description="AI-powered drug discovery platform",
     version="1.0.0"
 )
-
-app.include_router(render_router)
 
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000","http://localhost:5173","https://drug-discovery-frontend.onrender.com"],
+    allow_origins=["*"],  # For Render deployment
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Global variables
-device = None
+# Global variables - Lazy loaded
 dti_predictor = None
 drug_generator = None
+models_loaded = False
+
+def load_models():
+    """Lazy load models only when needed"""
+    global dti_predictor, drug_generator, models_loaded
+    
+    if models_loaded:
+        return True
+    
+    try:
+        print("🔄 Loading models...")
+        
+        # Check if model files exist
+        if not os.path.exists(DTI_MODEL_PATH):
+            print(f"⚠️ DTI model not found at {DTI_MODEL_PATH}")
+            return False
+        
+        if not os.path.exists(GENERATOR_MODEL_PATH):
+            print(f"⚠️ Generator model not found at {GENERATOR_MODEL_PATH}")
+            return False
+        
+        # Load DTI model
+        from .utils.dti_predictor import DTIPredictor
+        dti_model = DTIModel(drug_in_dim=1, prot_emb_dim=1024)
+        dti_model.load_state_dict(torch.load(DTI_MODEL_PATH, map_location=DEVICE))
+        dti_predictor = DTIPredictor(dti_model, DEVICE)
+        print("✅ DTI model loaded")
+        
+        # Load Generator
+        from .utils.drug_generator import DrugGenerator
+        generator = Generator(latent_dim=56, output_dim=128)
+        generator.load_state_dict(torch.load(GENERATOR_MODEL_PATH, map_location=DEVICE))
+        drug_generator = DrugGenerator(generator, dti_model, DEVICE)
+        print("✅ Generator model loaded")
+        
+        models_loaded = True
+        return True
+        
+    except Exception as e:
+        print(f"❌ Error loading models: {str(e)}")
+        return False
 
 @app.on_event("startup")
 async def startup_event():
-    """Load models on startup"""
-    global device, dti_predictor, drug_generator
-    
+    """Load models on startup if flag is set"""
     print("=" * 60)
     print("INITIALIZING DRUG DISCOVERY API")
     print("=" * 60)
+    print(f"✓ Device: {DEVICE}")
     
-    # Set device
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"✓ Device: {device}")
+    if LOAD_MODELS_ON_STARTUP:
+        load_models()
+    else:
+        print("⚠️ Models will be loaded on first request (lazy loading)")
     
-    if torch.cuda.is_available():
-        print(f"  GPU: {torch.cuda.get_device_name(0)}")
-        print(f"  CUDA Version: {torch.version.cuda}")
-    
-    # Model paths
-    base_path = Path(__file__).parent.parent / "models"
-    dti_model_path = base_path / "best_dti_model.pth"
-    generator_path = base_path / "generator_model.pth"
-    
-    # Check if models exist
-    if not dti_model_path.exists():
-        raise FileNotFoundError(f"DTI model not found at {dti_model_path}")
-    if not generator_path.exists():
-        raise FileNotFoundError(f"Generator model not found at {generator_path}")
-    
-    print(f"\n→ Loading DTI model from: {dti_model_path}")
-    
-    # Load DTI model
-    dti_model = DTIModel(drug_in_dim=1, prot_emb_dim=1024)
-    dti_model.load_state_dict(torch.load(dti_model_path, map_location=device))
-    dti_predictor = DTIPredictor(dti_model, device)
-    print("✓ DTI model loaded successfully")
-    
-    print(f"\n→ Loading Generator model from: {generator_path}")
-    
-    # Load Generator
-    generator = Generator(latent_dim=56, output_dim=128)
-    generator.load_state_dict(torch.load(generator_path, map_location=device))
-    drug_generator = DrugGenerator(generator, dti_model, device)
-    print("✓ Generator model loaded successfully")
-    
-    print("\n" + "=" * 60)
+    print("=" * 60)
     print("API READY!")
     print("=" * 60)
 
@@ -94,21 +99,24 @@ async def health_check():
     return HealthResponse(
         status="healthy",
         cuda_available=torch.cuda.is_available(),
-        device=str(device)
+        device=str(DEVICE)
     )
 
 @app.post("/api/predict-dti", response_model=DTIPredictionResponse)
 async def predict_dti(request: DTIPredictionRequest):
-    """
-    Predict drug-target interaction binding affinity
+    """Predict drug-target interaction binding affinity"""
     
-    - **smiles**: Drug molecule in SMILES format
-    - **protein_sequence**: Target protein amino acid sequence
-    """
+    # Lazy load models if not already loaded
+    if not models_loaded:
+        success = load_models()
+        if not success:
+            raise HTTPException(
+                status_code=503, 
+                detail="Models not available. Please contact administrator."
+            )
+    
     try:
         print(f"\n→ DTI Prediction Request")
-        print(f"  SMILES: {request.smiles}")
-        print(f"  Protein length: {len(request.protein_sequence)}")
         
         affinity = dti_predictor.predict(
             request.smiles,
@@ -130,16 +138,19 @@ async def predict_dti(request: DTIPredictionRequest):
 
 @app.post("/api/discover-drugs", response_model=DrugDiscoveryResponse)
 async def discover_drugs(request: DrugDiscoveryRequest):
-    """
-    Generate novel drug candidates for a target protein
+    """Generate novel drug candidates for a target protein"""
     
-    - **protein_sequence**: Target protein amino acid sequence
-    - **num_candidates**: Number of drug candidates to generate (1-100)
-    """
+    # Lazy load models if not already loaded
+    if not models_loaded:
+        success = load_models()
+        if not success:
+            raise HTTPException(
+                status_code=503, 
+                detail="Models not available. Please contact administrator."
+            )
+    
     try:
         print(f"\n→ Drug Discovery Request")
-        print(f"  Protein length: {len(request.protein_sequence)}")
-        print(f"  Candidates requested: {request.num_candidates}")
         
         candidates = drug_generator.generate_candidates(
             request.protein_sequence,
@@ -148,7 +159,6 @@ async def discover_drugs(request: DrugDiscoveryRequest):
         
         print(f"✓ Generated {len(candidates)} valid candidates")
         
-        # Format response
         drug_candidates = [
             DrugCandidate(
                 rank=idx + 1,
@@ -176,11 +186,19 @@ async def detailed_health():
     return {
         "status": "healthy",
         "cuda_available": torch.cuda.is_available(),
-        "device": str(device),
-        "gpu_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+        "device": str(DEVICE),
+        "models_loaded": models_loaded,
         "dti_model_loaded": dti_predictor is not None,
         "generator_loaded": drug_generator is not None
     }
+
+# Include render router if exists
+try:
+    from .render import router as render_router
+    app.include_router(render_router)
+    print("✓ Render router included")
+except ImportError:
+    print("⚠️ Render router not available")
 
 if __name__ == "__main__":
     import uvicorn
